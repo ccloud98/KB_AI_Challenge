@@ -7,11 +7,12 @@ from langchain_community.document_loaders import PyPDFLoader
 from langchain_chroma import Chroma
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.chains import RetrievalQA
+from langchain.schema import Document
 
 # --- CONFIG ---
 PDF_FOLDER = "KB_web_docs"
 VECTOR_STORE_DIR = "vector_store"
-os.environ["GOOGLE_API_KEY"] = ""
+os.environ["GOOGLE_API_KEY"] = "AIzaSyAc_-QEO_4M7u7carnU3LYbX626OvNuRW8"
 
 # --- OCR fallback loader ---
 def load_pdf_with_ocr(path):
@@ -62,9 +63,31 @@ def query_rag(question):
 
     llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash", temperature=0)
     qa = RetrievalQA.from_chain_type(llm, retriever=retriever)
-    return qa.invoke({"query": question})   
+    result = qa.invoke({"query": question})
+    
+    # Enhanced output formatting for better readability
+    print("\n" + "="*60)
+    print(f"Query: {question}")
+    print("="*60)
+    print("Answer:")
+    print("-"*60)
+    
+    answer = result.get('result', 'No answer found.')
+    
+    # Format answer with proper line breaks
+    if '\n' in answer:
+        for line in answer.split('\n'):
+            if line.strip():
+                print(line.strip())
+                print()
+    else:
+        print(answer)
+    
+    print("="*60 + "\n")
+    
+    return result
 
 if __name__ == "__main__":
     # build_or_update_vectorstore()
     # print(query_rag("Summarize the main points of the documents."))
-    print(query_rag("Which documents are related to use data privacy?"))
+    query_rag("각 서비스별 개인정보 처리 방침의 차이점은 무엇인가요??")
