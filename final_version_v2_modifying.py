@@ -15,6 +15,8 @@ import pytesseract
 from dataclasses import dataclass
 from dotenv import load_dotenv
 from typing import List, Dict, Any, Tuple
+from difflib import SequenceMatcher
+from urllib.parse import urlparse, parse_qs
 
 # =========================
 # Config & Globals
@@ -29,10 +31,8 @@ class WebSourceConfig:
     num_pages: int
     menu_no: int
 
-
 PDF_FOLDER = "KB_web_docs"
 PDF_CACHE_FILE = "pdf_cache.pkl"
-
 PROCESSED_URLS_FILE = "processed_urls.pkl"
 
 VECTOR_STORE_DIR = "vector_store"                 # 본문(문서) 벡터
@@ -52,7 +52,7 @@ EMBEDDINGS = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
 LLM = ChatGoogleGenerativeAI(model="gemini-2.0-flash", temperature=0)
 
 # =========================
-# 한국어 질의 전처리 (가벼운 규칙 기반)
+# 한국어 질의 전처리/확장
 # =========================
 
 _JOSA = r"(은|는|이|가|을|를|에|에서|으로|와|과|도|만|부터|까지|마다|처럼|보다|의|로서|이라면|이라도|이며|이고)$"
@@ -90,9 +90,15 @@ def _normalize_korean_query(text: str) -> str:
     t = re.sub(r"\s+", " ", t).strip()
     return t
 
-def generate_query_variants_korean(text: str, max_variants: int = 4) -> List[str]:
+def generate_query_variants_korean(text: str, max_variants: int = 8) -> List[str]:
+    base_raw = _basic_cleanup(text)
+    stripped = re.sub(r"(관련|관한|관련된)\b", " ", base_raw)
+    stripped = re.sub(r"(q\s*&\s*a|q\/a|q&a|qa|질문\s*답변|질답)", " ", stripped)
+    stripped = re.sub(r"\s+", " ", stripped).strip()
     base = _normalize_korean_query(text)
     variants = [base]
+    if stripped and stripped != base_raw:
+        variants.append(_normalize_korean_query(stripped))
     compact = re.sub(r"\s+", "", base)
     if compact != base:
         variants.append(compact)
@@ -124,7 +130,7 @@ def get_table_links(page_index, menu_no, base_list_url, base_url):
         if not href:
             continue
         if href.startswith("."):
-            href = href[1:]
+            href = href.lstrip("./")  # 안전하게 보정
         links.append(base_url + href)
     return links
 
@@ -269,13 +275,17 @@ def _ensure_chroma(dir_path: str, docs: List[Document]) -> Chroma:
         db = Chroma(persist_directory=dir_path, embedding_function=EMBEDDINGS)
         if docs:
             db.add_documents(docs)
-            try: db.persist()
-            except Exception: pass
+            try:
+                db.persist()
+            except Exception:
+                pass
         return db
     else:
         db = Chroma.from_documents(docs, EMBEDDINGS, persist_directory=dir_path)
-        try: db.persist()
-        except Exception: pass
+        try:
+            db.persist()
+        except Exception:
+            pass
         return db
 
 def build_or_update_vectorstore(force_refresh: bool = False):
@@ -314,13 +324,12 @@ def build_or_update_vectorstore(force_refresh: bool = False):
     return body_db, title_db
 
 # =========================
-# Scoring helpers (정확도 강화)
+# Scoring helpers
 # =========================
 
 def _to_similarity(dist: float, metric: str = "cosine") -> float:
-    """distance -> similarity 변환. 기본 cosine 가정."""
     if metric == "cosine":
-        return 1.0 - float(dist)           # cosine_distance = 1 - cosine_similarity
+        return 1.0 - float(dist)  # cosine_distance = 1 - cosine_similarity
     elif metric in ("l2", "euclidean"):
         return 1.0 / (1.0 + float(dist))
     else:
@@ -358,7 +367,6 @@ def _aggregate_variants_to_best(sim_list: List[float], mode: str = "softmax-mean
     return max(sim_list)
 
 def _apply_priors(meta: Dict[str, Any]) -> float:
-    """source_type/최신성 등 미세 가산. 값은 과도하지 않게."""
     st = (meta or {}).get("source_type", "")
     prior = 0.0
     if st in ("FAQS", "FAQ"):
@@ -368,13 +376,12 @@ def _apply_priors(meta: Dict[str, Any]) -> float:
     return prior
 
 def _fuse_title_body_scores(
-    title_pairs: List[Tuple[Document, float]],   # (doc, title_sim)
-    body_map: Dict[str, float],                  # source -> body_sim
+    title_pairs: List[Tuple[Document, float]],
+    body_map: Dict[str, float],
     w_title: float = 0.6,
     w_body: float = 0.4,
     use_rrf: bool = False,
 ) -> List[Tuple[Document, float]]:
-    """z-score 가중합 또는 RRF로 결합"""
     titles = [s for (_, s) in title_pairs]
     bodies = [body_map.get((d.metadata or {}).get("source", ""), 0.0) for (d, _) in title_pairs]
 
@@ -405,7 +412,193 @@ def _fuse_title_body_scores(
     return fused
 
 # =========================
-# 2단계 검색 (제목 선필터 → 본문 재평가) + 한국어 쿼리 확장 + 고급 스코어링
+# 🔧 동점 타이브레이커 + Lexical 게이트
+# =========================
+# PATCH-3: 부분 토큰(n-gram) 확장 지원
+
+def _tokenize_simple(s: str) -> List[str]:
+    """
+    공백 기준 1차 토큰화 후, 각 토큰에 대해 2~3글자 n-gram 서브토큰을 추가한다.
+    - 한국어/영문/숫자만 남기고 나머지는 제거
+    - 너무 짧은 조각 폭증 방지 위해 길이 제한 및 dedup 적용
+    """
+    s = _basic_cleanup(s)
+    base = [t for t in s.split() if t]
+    cleaned = []
+    for t in base:
+        t = re.sub(r"[^0-9a-z가-힣]", "", t)  # 문자/숫자만
+        if t:
+            cleaned.append(t)
+
+    out: set = set()
+    for t in cleaned:
+        out.add(t)
+        L = len(t)
+        # 2-gram
+        if L >= 2:
+            for i in range(L - 1):
+                out.add(t[i:i+2])
+        # 3-gram (길이 6 이상일 때만 추가로 생성해서 폭증 방지)
+        if L >= 6:
+            for i in range(L - 2):
+                out.add(t[i:i+3])
+
+    # 너무 짧은 단편은 제거(1글자 제외) — 한국어/영문 혼용 대비
+    out = {tok for tok in out if len(tok) >= 2}
+    return list(out)
+
+def _jaccard(a: List[str], b: List[str]) -> float:
+    if not a or not b:
+        return 0.0
+    A, B = set(a), set(b)
+    inter = len(A & B)
+    union = len(A | B)
+    return inter / union if union else 0.0
+
+def _extract_recency_from_url(url: str) -> int:
+    try:
+        qs = parse_qs(urlparse(url).query)
+        for key in ("nttId", "incdnSlno"):
+            if key in qs and qs[key]:
+                return int(qs[key][0])
+    except Exception:
+        pass
+    try:
+        qs = parse_qs(urlparse(url).query)
+        pi = int(qs.get("pageIndex", [0])[0])
+        return max(1, 100000 - pi)
+    except Exception:
+        return 0
+
+def _source_type_weight(meta: Dict[str, Any]) -> float:
+    st = (meta or {}).get("source_type", "")
+    return {"FAQS": 3.0, "FAQ": 3.0, "DISPUTES": 2.0, "PDF": 1.0}.get(st, 0.0)
+
+def _title_tiebreak_key(doc: Document, sim: float, query: str) -> tuple:
+    title = (doc.metadata or {}).get("title") or ""
+    url   = (doc.metadata or {}).get("source") or ""
+    t_norm = _basic_cleanup(title)
+    q_norm = _basic_cleanup(query)
+    toks_t = _tokenize_simple(title)
+    toks_q = _tokenize_simple(query)
+    exact = 1 if t_norm == q_norm else 0
+    starts = 1 if (t_norm.startswith(q_norm) or q_norm.startswith(t_norm)) else 0
+    contains = 1 if (q_norm in t_norm or t_norm in q_norm) else 0
+    jac = _jaccard(toks_t, toks_q)
+    ratio = SequenceMatcher(None, q_norm, t_norm).ratio()
+    st_w = _source_type_weight(doc.metadata)
+    rec = _extract_recency_from_url(url)
+    short_bonus = -len(t_norm)
+    return (sim, exact, starts, contains, jac, ratio, st_w, rec, short_bonus)
+
+# === 패치 1: 핵심 토큰 기반 불용어 제거 + 강화된 게이트 ===
+STOPWORDS_KO = {
+    "관련","관한","관련된","질문","답변","q&a","qa","q/a",
+    "어떻게","되나요","되나","됩니까","무엇","무엇인가요",
+    "가능","인가요","이다","하다","합니다","해요",
+    "안내","유의사항","문의","바로가기"
+}
+
+def _content_tokens(s: str) -> List[str]:
+    toks = _tokenize_simple(s)
+    return [t for t in toks if t not in STOPWORDS_KO and len(t) >= 2]
+
+def _passes_lexical_gate(title: str, query: str, min_jaccard: float = 0.08) -> bool:
+    toks_t = _content_tokens(title)
+    toks_q = _content_tokens(query)
+    if not toks_t or not toks_q:
+        return False
+    overlap = len(set(toks_t) & set(toks_q))
+    need = 1 if len(toks_q) <= 3 else 2  # 최소 겹침 개수
+    if overlap < need:
+        return False
+    jac = _jaccard(toks_t, toks_q)
+    t_norm = _basic_cleanup(title)
+    q_norm = _basic_cleanup(query)
+    contains = (q_norm in t_norm) or (t_norm in q_norm)
+    return (jac >= min_jaccard) or contains
+
+# =========================
+# 문서 내부 로컬 관련도 (인덱스는 문서 단위 유지)
+# =========================
+
+STOP_PHRASES = {"고객센터","유의사항","문의","자료실","바로가기"}
+
+def split_passages(text: str, target_len: int = 220, stride: int = 110) -> List[str]:
+    """
+    인덱스는 문서단위 유지. 런타임에만 문서 내부를 얕게 슬라이스.
+    토큰은 _tokenize_simple 재사용(부분 n-gram 포함).
+    """
+    toks = _tokenize_simple(text)
+    if not toks:
+        return []
+    passages = []
+    for i in range(0, max(1, len(toks)-target_len+1), stride):
+        chunk = " ".join(toks[i:i+target_len])
+        if chunk:
+            passages.append(chunk)
+        if len(passages) >= 80:  # 안전 상한
+            break
+    if not passages:
+        passages = [" ".join(toks[:target_len])]
+    return passages
+
+def keyword_overlap(q_tokens: List[str], p_tokens: List[str]) -> float:
+    Q, P = set(q_tokens), set(p_tokens)
+    inter = len(Q & P)
+    return inter / max(1, len(Q))
+
+def local_score_simple(query: str, passage: str) -> float:
+    tq = _tokenize_simple(query)
+    tp = _tokenize_simple(passage)
+    if not tq or not tp:
+        return 0.0
+    jac = _jaccard(tq, tp)
+    cover = keyword_overlap(tq, tp)
+    return 0.5 * jac + 0.5 * cover
+
+def boiler_penalty(text: str) -> float:
+    t = _basic_cleanup(text)
+    hits = sum(1 for s in STOP_PHRASES if s in t)
+    return 0.02 * hits  # 최종 점수에서 뺄 예정
+
+def doc_keyword_coverage(query: str, text: str) -> float:
+    tq = set(_tokenize_simple(query))
+    tt = set(_tokenize_simple(text))
+    if not tq or not tt:
+        return 0.0
+    return len(tq & tt) / max(1, len(tq))
+
+def rerank_inside_doc(doc: Document, query: str, emb_sim: float) -> Tuple[float, Dict[str, float]]:
+    """
+    최종 점수 = α*임베딩유사도 + β*문서내로컬최대 + γ*질의커버리지 + δ*제목보너스 - λ*보일러패널티
+    """
+    text = doc.page_content or ""
+    passages = split_passages(text, target_len=220, stride=110)
+    max_local = 0.0
+    for p in passages:
+        s = local_score_simple(query, p)
+        if s > max_local:
+            max_local = s
+
+    cover = doc_keyword_coverage(query, text)
+    title = (doc.metadata or {}).get("title", "") or ""
+    title_hit = local_score_simple(query, title)
+    penalty = boiler_penalty(text)
+
+    # 하드 가드: 로컬·커버 모두 0이면 탈락
+    if max_local == 0.0 and cover == 0.0:
+        parts = {"emb":emb_sim, "local":0.0, "cover":0.0, "title":title_hit, "pen":penalty, "final":-1e9}
+        return -1e9, parts
+
+    # 가중치
+    alpha, beta, gamma, delta, lamb = 0.6, 0.25, 0.10, 0.05, 1.0
+    final = alpha*emb_sim + beta*max_local + gamma*cover + delta*title_hit - lamb*penalty
+    parts = {"emb":emb_sim, "local":max_local, "cover":cover, "title":title_hit, "pen":penalty, "final":final}
+    return final, parts
+
+# =========================
+# 2단계 검색 (제목 선필터 → 본문 재평가) + 한국어 쿼리 확장 + 적응형 k + 게이트
 # =========================
 
 def staged_retrieve(body_db: Chroma, title_db: Chroma, question: str, topk: int = 8,
@@ -416,27 +609,46 @@ def staged_retrieve(body_db: Chroma, title_db: Chroma, question: str, topk: int 
     variants = generate_query_variants_korean(question)
     print(f"[Query variants] {variants}")
 
-    # --- Stage 1: 제목 검색 (변형 통합; source별 best title_sim) ---
-    title_best_sims: Dict[str, List[float]] = {}  # source -> [sim per variant]
-    title_rep: Dict[str, Document] = {}
-    for q in variants:
-        res = title_db.similarity_search_with_score(q, k=title_k)
-        for d, dist in res:
-            src = (d.metadata or {}).get("source", "")
-            sim = _to_similarity(dist, metric)
-            if src not in title_best_sims:
-                title_best_sims[src] = []
-                title_rep[src] = d
-            title_best_sims[src].append(sim)
+    def run_title_search(k_val: int, use_gate: bool = True):
+        title_best_sims: Dict[str, List[float]] = {}
+        title_rep: Dict[str, Document] = {}
+        for q in variants:
+            res = title_db.similarity_search_with_score(q, k=k_val)
+            for d, dist in res:
+                if use_gate and not _passes_lexical_gate((d.metadata or {}).get("title",""), q):
+                    continue
+                src = (d.metadata or {}).get("source", "")
+                sim = _to_similarity(dist, metric)
+                if src not in title_best_sims:
+                    title_best_sims[src] = []
+                    title_rep[src] = d
+                title_best_sims[src].append(sim)
+        return title_best_sims, title_rep
+
+    # 1차 시도 (gate ON)
+    title_best_sims, title_rep = run_title_search(title_k, use_gate=True)
+
+    # 실패 시 k 확장 (gate ON)
+    if not title_best_sims:
+        for k_try in (300, 800):
+            title_best_sims, title_rep = run_title_search(k_try, use_gate=True)
+            if title_best_sims:
+                print(f"[title-stage] expanded k → {k_try}")
+                break
+
+    # 그래도 실패면 gate OFF fallback
+    if not title_best_sims:
+        title_best_sims, title_rep = run_title_search(800, use_gate=False)
+        if title_best_sims:
+            print("[title-stage] no gate fallback used")
 
     if not title_best_sims:
         return []
 
-    # 변형 집계
     title_final: Dict[str, float] = {src: _aggregate_variants_to_best(sims, mode=variant_agg)
                                      for src, sims in title_best_sims.items()}
 
-    # --- Stage 2: 본문 재검색 (제목 후보만; 변형 통합) ---
+    # Stage 2: 본문 재검색 (제목 후보만)
     candidate_sources = list(title_final.keys())
     body_sims: Dict[str, List[float]] = {src: [] for src in candidate_sources}
     for q in variants:
@@ -454,31 +666,50 @@ def staged_retrieve(body_db: Chroma, title_db: Chroma, question: str, topk: int 
     body_final: Dict[str, float] = {src: _aggregate_variants_to_best(sims, mode=variant_agg)
                                     for src, sims in body_sims.items()}
 
-    # --- 결합 (z-score 가중합 or RRF) ---
+    # 결합 + 타이브레이크(기존)
     title_pairs = [(title_rep[src], title_final.get(src, 0.0)) for src in candidate_sources]
     merged = _fuse_title_body_scores(title_pairs, body_final, w_title=0.6, w_body=0.4, use_rrf=use_rrf)
+    merged.sort(key=lambda x: _title_tiebreak_key(x[0], x[1], question), reverse=True)
 
-    # --- 최종 상위 topk의 '본문 문서' 반환 ---
-    selected_docs = []
-    used_src = set()
+    # 문서 내부 로컬 관련도 기반 재랭크(인덱스는 문서 단위 유지)
+    per_source_best: Dict[str, Tuple[Document, float, Dict[str, float]]] = {}
+
     for doc, _ in merged:
         src = (doc.metadata or {}).get("source", "")
-        if src in used_src:
-            continue
+        if src in per_source_best:
+            continue  # source 당 하나만 평가(비용 절감)
+
+        # 쿼리 기준으로 그 source 내에서 가장 관련있는 본문 문서를 1개 고름
         try:
-            body_res = body_db.similarity_search(doc.page_content, k=1, filter={"source": src})
+            q_best = body_db.similarity_search_with_score(
+                question, k=3, filter={"source": src}
+            )
         except Exception:
-            body_res = []
-        if not body_res:
-            tmp = body_db.similarity_search(doc.page_content, k=8)
-            tmp = [d for d in tmp if (d.metadata or {}).get("source", "") == src]
-            if tmp:
-                body_res = [tmp[0]]
-        if body_res:
-            selected_docs.append(body_res[0])
-            used_src.add(src)
-        if len(selected_docs) >= topk:
-            break
+            q_best = []
+        if not q_best:
+            # fallback: 제목 대표의 텍스트 기준으로 탐색
+            try:
+                q_best = body_db.similarity_search_with_score(doc.page_content, k=1, filter={"source": src})
+            except Exception:
+                q_best = []
+
+        if not q_best:
+            continue
+
+        bd, dist = q_best[0]
+        emb_sim = _to_similarity(dist, metric)
+        final_score, parts = rerank_inside_doc(bd, question, emb_sim)
+        per_source_best[src] = (bd, final_score, parts)
+
+    # 최종 상위 topk 선택
+    ranked = sorted(per_source_best.values(), key=lambda x: x[1], reverse=True)
+    selected_docs: List[Document] = []
+    for bd, score, parts in ranked[:topk]:
+        # 디버깅 확인용
+        # print(f"[final-rerank] src={ (bd.metadata or {}).get('source','') } "
+        #       f"score={score:.4f} parts={parts}")
+        selected_docs.append(bd)
+
     return selected_docs
 
 # =========================
@@ -546,8 +777,62 @@ def view_processed_urls_pairs(start: int = 0, full: bool = False, max_chars: int
     view_cache_pairs(PROCESSED_URLS_FILE, start=start, full=full, max_chars=max_chars)
 
 # =========================
+# 벡터스토어/제목 DB 점검 & 디버그
+# =========================
+
+def assert_vectorstores_ready():
+    body = Chroma(persist_directory=VECTOR_STORE_DIR, embedding_function=EMBEDDINGS)
+    title = Chroma(persist_directory=TITLE_VECTOR_STORE_DIR, embedding_function=EMBEDDINGS)
+    try:
+        body_count = len(body.get(include=[] )["ids"])
+    except Exception:
+        body_count = -1
+    try:
+        title_count = len(title.get(include=[] )["ids"])
+    except Exception:
+        title_count = -1
+    print(f"[VS READY] body={body_count}, title={title_count}")
+    if body_count <= 0 or title_count <= 0:
+        print("-> 벡터스토어가 비어있습니다. build_or_update_vectorstore(force_refresh=True)를 먼저 호출하세요.")
+
+def debug_find_by_title(substr: str, k: int = 10):
+    title_db = Chroma(persist_directory=TITLE_VECTOR_STORE_DIR, embedding_function=EMBEDDINGS)
+    q = _basic_cleanup(substr)
+
+    def run(kv: int, use_gate: bool = True):
+        hits = title_db.similarity_search_with_score(q, k=kv)
+        if not hits:
+            return []
+        if use_gate:
+            hits = [(d, dist) for d, dist in hits if _passes_lexical_gate((d.metadata or {}).get("title",""), q)]
+        scored = [(d, 1 - float(dist)) for d, dist in hits]  # cosine 가정
+        scored.sort(key=lambda x: _title_tiebreak_key(x[0], x[1], substr), reverse=True)
+        return scored
+
+    print(f'--- search titles for: "{substr}" ---')
+    scored = run(max(k, 100), use_gate=True)
+    if not scored:
+        print("(gate pass=0) retry with larger k and relaxed gate…")
+        scored = run(800, use_gate=False)
+    if not scored:
+        print("(no hits after fallback)")
+        return
+    for d, sim in scored[:k]:
+        print(f"{sim:.3f} | {d.metadata.get('title')} | {d.metadata.get('source')}")
+
+def _count_chroma(persist_dir: str) -> int:
+    try:
+        db = Chroma(persist_directory=persist_dir, embedding_function=EMBEDDINGS)
+        return len(db.get(include=[])["ids"])
+    except Exception:
+        return 0
+
+# =========================
 # QA (RAG) – 커스텀 2단계 검색 + 커스텀 프롬프트
 # =========================
+
+from langchain.prompts import ChatPromptTemplate, SystemMessagePromptTemplate, HumanMessagePromptTemplate
+from langchain.chains.combine_documents import create_stuff_documents_chain
 
 def query_rag(question: str):
     body_db = Chroma(persist_directory=VECTOR_STORE_DIR, embedding_function=EMBEDDINGS)
@@ -561,9 +846,6 @@ def query_rag(question: str):
     if not top_docs:
         print("검색 결과가 없습니다.")
         return ""
-
-    from langchain.prompts import ChatPromptTemplate, SystemMessagePromptTemplate, HumanMessagePromptTemplate
-    from langchain.chains.question_answering import load_qa_chain
 
     system_text = (
         "당신은 금융 분쟁/FAQ 문서를 근거로 답하는 한국어 어시스턴트입니다. "
@@ -583,15 +865,13 @@ def query_rag(question: str):
         HumanMessagePromptTemplate.from_template(human_text),
     ])
 
-    chain = load_qa_chain(LLM, chain_type="stuff", chain_type_kwargs={"prompt": prompt})
+    stuff_chain = create_stuff_documents_chain(LLM, prompt)
+    result = stuff_chain.invoke({"question": question, "context": top_docs})
 
-    context_text = "\n\n---\n\n".join([d.page_content for d in top_docs])
-    result = chain.invoke({"input_documents": [], "question": question, "context": context_text})
-
-    answer = result["output_text"]
+    answer = result
     print("Answer:", answer)
     print("\nSource docs:")
-    for d in top_docs:
+    for d in top_docs[:1]:
         print("-", d.metadata.get("title") or d.metadata.get("source", "unknown"))
     return answer
 
@@ -600,24 +880,27 @@ def query_rag(question: str):
 # =========================
 
 if __name__ == "__main__":
-    # 1) 최초/갱신 빌드: 문서 단위 색인 + 제목 인덱스 동시 구축
-    # body_db, title_db = build_or_update_vectorstore(force_refresh=True)
+    # 0) 제목 벡터스토어가 비어 있으면 자동 복구 (캐시 기반)
+    title_count_before = _count_chroma(TITLE_VECTOR_STORE_DIR)
+    if title_count_before == 0:
+        print("[INIT] Title vector store is empty → building title/body stores from caches…")
+        build_or_update_vectorstore(force_refresh=False)
 
-    # PDF 캐시 0~1번 (2개) 미리보기
-    view_pdf_cache_pairs(start=0, full=False)
+    # 1) 벡터스토어 준비 상태 점검
+    assert_vectorstores_ready()
 
-    # PDF 캐시 2~3번 (다음 2개) 전체 출력
-    view_pdf_cache_pairs(start=2, full=True)
+    # 2) 제목 인덱스 점검 (lexical gate + 확장 재시도)
+    # debug_find_by_title("카드단말기 IC전환", k=10)
+    # debug_find_by_title("카드단말기 IC전환 관련 Q&A", k=10)
+    # debug_find_by_title("근저당", k=10)
 
-    # 분쟁사례 웹 캐시 0~1번
-    view_web_cache_pairs(start=0, full=False)
+    # 3) 샘플 질의(원하면 주석 해제)
+    # result = query_rag("신용감독제도에 대해 설명해주세요.")
+    result = query_rag("신용감독제도에 어떤 수단이 있나요?")
+    
+    # 쓸 예시
+    # result = query_rag("해제 수수료, 재개 수수료를 사전 고지를 받지 못했습니다. 어떻게 대응해야 할까요?")
 
-    # FAQ 캐시 10~11번
-    view_faqs_cache_pairs(start=10, full=False)
+    # result = query_rag("소비자보호실태평가가 뭔지 알려줘.")
 
-    # 처리된 URL 0~1번
-    view_processed_urls_pairs(start=0)
-
-    # 2) 샘플 질의
-    result = query_rag("카드단말기 IC전환")
-    print(result)
+    # result = query_rag("해제 수수료, 재개 수수료를 사전 고지를 받지 못했습니다. 어떻게 대응해야 할까요?")
