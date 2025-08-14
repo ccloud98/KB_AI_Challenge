@@ -607,7 +607,7 @@ def staged_retrieve(body_db: Chroma, title_db: Chroma, question: str, topk: int 
                     variant_agg: str = "softmax-mean",
                     use_rrf: bool = False) -> List[Document]:
     variants = generate_query_variants_korean(question)
-    print(f"[Query variants] {variants}")
+    # print(f"[Query variants] {variants}")
 
     def run_title_search(k_val: int, use_gate: bool = True):
         title_best_sims: Dict[str, List[float]] = {}
@@ -844,8 +844,7 @@ def query_rag(question: str):
         metric="cosine", variant_agg="softmax-mean", use_rrf=False
     )
     if not top_docs:
-        print("검색 결과가 없습니다.")
-        return ""
+        return {"answer": "", "sources": []}
 
     system_text = (
         "당신은 금융 분쟁/FAQ 문서를 근거로 답하는 한국어 어시스턴트입니다. "
@@ -866,41 +865,88 @@ def query_rag(question: str):
     ])
 
     stuff_chain = create_stuff_documents_chain(LLM, prompt)
-    result = stuff_chain.invoke({"question": question, "context": top_docs})
+    answer_text = stuff_chain.invoke({"question": question, "context": top_docs})
 
-    answer = result
-    print("Answer:", answer)
-    print("\nSource docs:")
-    for d in top_docs[:1]:
-        print("-", d.metadata.get("title") or d.metadata.get("source", "unknown"))
-    return answer
+    # 깔끔한 출처 목록 구성
+    sources = []
+    seen = set()
+    for d in top_docs:
+        src = (d.metadata or {}).get("source", "")
+        title = (d.metadata or {}).get("title") or src or "untitled"
+        if src and src not in seen:
+            seen.add(src)
+            sources.append({"title": title, "url": src})
+
+    return {"answer": answer_text, "sources": sources}
+
+# 무응답/불확실 답변 패턴 감지
+_NOANSWER_PATTERNS = (
+    "찾지 못했습니다", "확인되지 않았습니다", "모르겠습니다",
+    "근거가 없습니다", "제공된 문서 컨텍스트에서", "충분한 정보가", "찾을 수 없습니다."
+)
+
+def _is_noanswer(text: str) -> bool:
+    if not text or not text.strip():
+        return True
+    t = text.strip()
+    return any(pat in t for pat in _NOANSWER_PATTERNS)
 
 # =========================
 # Main
 # =========================
 
 if __name__ == "__main__":
-    # 0) 제목 벡터스토어가 비어 있으면 자동 복구 (캐시 기반)
+    # 제목 벡터스토어가 비어 있으면 자동 복구 (캐시 기반)
     title_count_before = _count_chroma(TITLE_VECTOR_STORE_DIR)
     if title_count_before == 0:
         print("[INIT] Title vector store is empty → building title/body stores from caches…")
         build_or_update_vectorstore(force_refresh=False)
 
-    # 1) 벡터스토어 준비 상태 점검
-    assert_vectorstores_ready()
+    print("\n" + "="*68)
+    print(" 금융 분쟁/FAQ RAG 어시스턴트 ".center(68, " "))
+    print("="*68)
+    print("질문을 입력하세요. (종료: exit / quit / q / 종료)")
+    print("-" * 68)
 
-    # 2) 제목 인덱스 점검 (lexical gate + 확장 재시도)
-    # debug_find_by_title("카드단말기 IC전환", k=10)
-    # debug_find_by_title("카드단말기 IC전환 관련 Q&A", k=10)
-    # debug_find_by_title("근저당", k=10)
+    while True:
+        try:
+            q = input("\n질문 > ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n\n종료합니다.")
+            break
 
-    # 3) 샘플 질의(원하면 주석 해제)
-    # result = query_rag("신용감독제도에 대해 설명해주세요.")
-    result = query_rag("신용감독제도에 어떤 수단이 있나요?")
-    
-    # 쓸 예시
-    # result = query_rag("해제 수수료, 재개 수수료를 사전 고지를 받지 못했습니다. 어떻게 대응해야 할까요?")
+        if not q:
+            continue
+        if q.lower() in ("exit", "quit", "q", "종료"):
+            print("종료합니다.")
+            break
 
-    # result = query_rag("소비자보호실태평가가 뭔지 알려줘.")
+        t0 = time.time()
+        result = query_rag(q)
+        dt = time.time() - t0
 
-    # result = query_rag("해제 수수료, 재개 수수료를 사전 고지를 받지 못했습니다. 어떻게 대응해야 할까요?")
+        answer = (result or {}).get("answer", "").strip()
+        sources = (result or {}).get("sources", [])
+
+        print("\n" + "="*68)
+        print("답변".center(68, " "))
+        print("-"*68)
+        if _is_noanswer(answer):
+            print("죄송합니다. 제공된 문서 컨텍스트에서 답을 찾지 못했습니다.")
+            show_sources = False
+        else:
+            print(answer)
+            show_sources = True
+
+        print("\n" + "출처".center(68, " "))
+        print("-"*68)
+        if show_sources and sources:
+            for i, s in enumerate(sources, 1):
+                title = s.get("title", "untitled")
+                url = s.get("url", "")
+                print(f"{i}. {title}\n   ↳ {url}")
+        else:
+            print("표시할 출처가 없습니다.")
+
+        print("\n처리시간: {:.2f}s".format(dt))
+        print("="*68)
